@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-ERC20Permit.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
+
+contract HaroldToken is ERC20, ReentrancyGuard, Ownable(msg.sender), Pausable {
+    using SafeMath for uint256;
+
+    uint256 private constant MAX_SUPPLY = 21000000 * 10**18; // 21 million tokens
+
+    // Tax parameters for liquidity and marketing
+    uint256 private _liquidityTax = 15; // 1.5%
+    uint256 private _marketingTax = 15; // 1.5%
+    uint256 private _totalTax = _liquidityTax + _marketingTax;
+
+    address payable private _marketingWallet;
+    address payable private _liquidityWallet;
+
+    // Uniswap Router and Pair variables
+    IUniswapV2Router02 private uniswapV2Router;
+    address private uniswapV2Pair;
+    bool private tradingOpen;
+    bool private inSwap = false;
+    bool private swapEnabled = false;
+
+    // Event to signal max transaction amount update
+    event MaxTxAmountUpdated(uint256 maxTxAmount);
+
+    mapping(address => uint256) private _balanceOf;
+
+    modifier lockTheSwap() {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor(
+//        address payable _marketingWallet
+ //       address payable liquidityWallet
+    ) ERC20("Harold Token", "HRLD") {
+        _mint(msg.sender, MAX_SUPPLY);
+        _marketingWallet = payable(0x5991d6570207dE6CAf44b822198109363C7d27d6);  // Set the marketing wallet address
+ //       _liquidityWallet = payable(0xe827747318);  // Set the liquidity wallet address
+        emit Transfer(address(0), msg.sender, MAX_SUPPLY);
+    }
+
+    // Function to add liquidity to Uniswap and apply taxes
+    function addLiquidity() external onlyOwner {
+        // Approve spending of total supply to Uniswap
+        _approve(address(this), address(uniswapV2Router), MAX_SUPPLY);
+
+        // Mint liquidity to Uniswap
+        uniswapV2Router.addLiquidityETH{
+            value: address(this).balance
+        }(
+            address(this),
+            balanceOf(address(this)),
+            0,
+            0,
+            owner(),
+            block.timestamp
+        );
+    }
+
+    // Function to swap tokens for ETH on Uniswap
+    function swapTokensForEth(uint256 tokenAmount) private lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    // Function to send ETH to the fee addresses
+    function sendETHToFee(uint256 marketingAmount, uint256 liquidityAmount) private {
+        require(marketingAmount.add(liquidityAmount) <= address(this).balance, "Insufficient ETH balance");
+        _marketingWallet.transfer(marketingAmount);
+        _liquidityWallet.transfer(liquidityAmount);
+    }
+
+    // Function to open trading, initialize Uniswap, and provide initial liquidity
+    function openTrading() external onlyOwner {
+        require(!tradingOpen, "Trading is already open");
+        uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        _approve(address(this), address(uniswapV2Router), MAX_SUPPLY);
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(address(this), uniswapV2Router.WETH());
+        uniswapV2Router.addLiquidityETH{
+            value: address(this).balance
+        }(
+            address(this),
+            balanceOf(address(this)),
+            0,
+            0,
+            owner(),
+            block.timestamp
+        );
+        IERC20(uniswapV2Pair).approve(address(uniswapV2Router), type(uint256).max);
+        swapEnabled = true;
+        tradingOpen = true;
+    }
+
+    // Function to set the liquidity tax rate (onlyOwner)
+    function setLiquidityTax(uint256 liquidityTax) external onlyOwner {
+        require(liquidityTax <= 1000, "Tax value should be less than or equal to 1000"); // 1000 represents 100%
+        _liquidityTax = liquidityTax;
+        _totalTax = _liquidityTax + _marketingTax;
+    }
+
+    // Function to set the marketing tax rate (onlyOwner)
+    function setMarketingTax(uint256 marketingTax) external onlyOwner {
+        require(marketingTax <= 1000, "Tax value should be less than or equal to 1000"); // 1000 represents 100%
+        _marketingTax = marketingTax;
+        _totalTax = _liquidityTax + _marketingTax;
+    }
+
+    // Function to get the current buy tax
+    function getCurrentBuyTax() private view returns (uint256) {
+        return _totalTax;
+    }
+
+    // Function to get the current sell tax
+    function getCurrentSellTax() private view returns (uint256) {
+        return _totalTax;
+    }
+
+    // Function to check if the transaction sender is selling tokens
+    function isSell(address sender) private view returns (bool) {
+        return sender == uniswapV2Pair;
+    }
+
+     // Function to check if tax is enabled during trading
+    function isTaxEnabled() private view returns (bool) {
+        return tradingOpen;
+    }
+
+    // Function to check if an address is taxable
+    function isTaxable(address account) private view returns (bool) {
+        return account != owner() && account != _marketingWallet && account != _liquidityWallet;
+    }
+
+    // The hook to apply taxes
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        if (isTaxable(from) && isTaxable(to)) {
+            uint256 taxAmount = amount.mul(_totalTax).div(10000);
+            uint256 tokensToTransfer = amount.sub(taxAmount);
+
+            uint256 fromBalance = balanceOf(from);
+            require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+
+            _balanceOf[from] = fromBalance - amount;
+            _balanceOf[to] += tokensToTransfer;
+            _balanceOf[_marketingWallet] += taxAmount;
+
+            emit Transfer(from, to, tokensToTransfer);
+            emit Transfer(from, _marketingWallet, taxAmount);
+        } else {
+            super._transfer(from, to, amount);
+        }
+    }
+}
